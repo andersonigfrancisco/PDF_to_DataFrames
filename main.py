@@ -1,91 +1,104 @@
 import camelot
 import pandas as pd
-from tabulate import tabulate
-import itertools
+import sqlite3
 
 file_path = "TEST2.pdf"
+database_path = "pdf_data.db"
 
-try:
-    # Extrair tabelas do PDF usando Camelot
-    tables = camelot.read_pdf(file_path, pages='all', flavor='stream', strip_text='\n')
+def create_database_table(final_df):
+    # Conectar ao banco de dados SQLite
+    conn = sqlite3.connect(database_path)
+    cursor = conn.cursor()
 
-    if not tables:
-        print("Nenhuma tabela encontrada no arquivo PDF.")
-    else:
-        # Inicializar uma lista vazia para armazenar os DataFrames
-        dfs = []
+    try:
+        # Verificar se o DataFrame final está vazio
+        if final_df.empty:
+            print("O DataFrame final está vazio. Nenhuma tabela será criada no banco de dados.")
+            return
 
-        for table in tables:
-            # Obter o DataFrame da tabela atual
-            df = table.df
+        # Limpar a tabela existente (opcional)
+        cursor.execute("DROP TABLE IF EXISTS pdf_data")
+        conn.commit()
 
-            # Remover linhas completamente vazias e linhas com células vazias
-            df = df.dropna(how='all').reset_index(drop=True)
+        # Montar a query para criar a tabela com base nas colunas do DataFrame final
+        columns = final_df.columns.tolist()
+        column_types = ['TEXT'] * len(columns)  # Definir todas as colunas como TEXT por padrão para SQLite
 
-            # Verificar se há células vazias na primeira coluna e ajustar se necessário
-            if pd.isna(df.iloc[0, 0]):
-                df.iloc[0, 0] = df.iloc[1, 0]
+        query = f"CREATE TABLE IF NOT EXISTS pdf_data ({', '.join([f'{col} {ctype}' for col, ctype in zip(columns, column_types)])})"
+        cursor.execute(query)
 
-            # Adicionar o DataFrame ajustado à lista
-            dfs.append(df)
+        conn.commit()
+        print("Tabela criada no banco de dados SQLite.")
 
-        # Concatenar todos os DataFrames da lista final
-        final_df = pd.concat(dfs, ignore_index=True)
+    except sqlite3.Error as e:
+        print(f"Erro ao criar tabela no SQLite: {e}")
 
-        # Converter todas as colunas que podem ser convertidas para numérico
-        for col in final_df.columns:
-            try:
-                final_df[col] = pd.to_numeric(final_df[col].str.replace(',', ''), errors='raise')
-            except:
-                continue
+    finally:
+        conn.close()
 
-        # Preencher valores faltantes com um valor padrão (zero)
-        final_df = final_df.fillna(0)
+def process_pdf_and_store(file_path):
+    try:
+        # Extrair tabelas do PDF usando Camelot
+        tables = camelot.read_pdf(file_path, pages='all', flavor='stream', strip_text='\n')
 
-        # Definir um limite de caracteres por linha para evitar distorções
-        max_chars_per_line = 100
+        if not tables:
+            print("Nenhuma tabela encontrada no arquivo PDF.")
+        else:
+            # Inicializar uma lista para armazenar os DataFrames
+            dfs = []
 
-        # Imprimir o DataFrame final com tabulate com paginação e ajuste automático de colunas
-        headers = final_df.columns.tolist()
-        rows = final_df.values.tolist()
+            for table in tables:
+                # Obter o DataFrame da tabela atual
+                df = table.df
 
-        # Tamanho máximo de linhas por página
-        max_rows_per_page = 20
+                # Remover linhas completamente vazias
+                df = df.dropna(how='all').reset_index(drop=True)
 
-        for page in itertools.zip_longest(*[iter(rows)]*max_rows_per_page):
-            page = [item for item in page if item is not None]
+                # Preencher células vazias com strings vazias
+                df = df.replace(r'^\s*$', '', regex=True)
 
-            # Ajuste automático de largura das colunas
-            colalign = ['left'] * len(headers)
+                # Adicionar DataFrame ajustado à lista, se não estiver vazio
+                if not df.empty:
+                    dfs.append(df)
 
-            # Limitar caracteres por linha para evitar distorções
-            page_formatted = []
-            for row in page:
-                row_formatted = []
-                for col_idx, col_value in enumerate(row):
-                    if isinstance(col_value, str) and len(col_value) > max_chars_per_line:
-                        col_value = col_value[:max_chars_per_line] + '...'
-                    row_formatted.append(col_value)
-                page_formatted.append(row_formatted)
+            if dfs:
+                # Concatenar todos os DataFrames da lista final
+                final_df = pd.concat(dfs, ignore_index=True)
 
-            # Ajuste manual de larguras para algumas colunas críticas (exemplo)
-            # Largura padrão (automaticamente ajustada) para o restante das colunas
-            colwidths = [25, 50, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+                # Gerar nomes de coluna automáticos se estiverem vazios ou não especificados
+                final_df.columns = [f"Column_{idx+1}" if not isinstance(col, str) or col.strip() == '' else col.strip() for idx, col in enumerate(final_df.columns)]
 
-            print(tabulate(page_formatted, headers=headers, tablefmt='grid', colalign=colalign))
-            
-            # Pausa a cada página para permitir a visualização
-            input("Pressione Enter para continuar...")
+                # Imprimir o DataFrame final com formatação de tabela
+                print("\n=== DataFrame Final Concatenado ===")
+                print(final_df.to_string(index=False))
 
-        # Exemplo de análise descritiva
-        print("\nAnálise Descritiva:")
-        desc_stats = final_df.describe().reset_index()
-        print(tabulate(desc_stats, headers='keys', tablefmt='grid', floatfmt=".2f"))
+                # Criar a tabela no banco de dados SQLite baseado no DataFrame final
+                create_database_table(final_df)
 
-        # Exportar para CSV (opcional)
-        final_df.to_csv('dados_processados.csv', index=False)
+                # Verificar se as colunas do DataFrame final correspondem às da tabela no banco de dados SQLite
+                conn = sqlite3.connect(database_path)
+                db_columns = pd.read_sql("PRAGMA table_info('pdf_data')", conn)['name'].tolist()
+                conn.close()
 
-except FileNotFoundError:
-    print(f"Arquivo PDF não encontrado: {file_path}")
-except Exception as e:
-    print(f"Erro ao processar o PDF: {e}")
+                if set(final_df.columns) != set(db_columns):
+                    raise ValueError("As colunas do DataFrame final não correspondem às colunas da tabela no banco de dados SQLite.")
+
+                # Inserir dados no banco de dados SQLite
+                conn = sqlite3.connect(database_path)
+                final_df.to_sql('pdf_data', conn, if_exists='append', index=False)
+                conn.close()
+
+                print("\nDados inseridos com sucesso no banco de dados SQLite.")
+
+            else:
+                print("Nenhum DataFrame válido encontrado.")
+
+    except FileNotFoundError:
+        print(f"Arquivo PDF não encontrado: {file_path}")
+    except ValueError as ve:
+        print(f"Erro ao processar o PDF: {ve}")
+    except Exception as e:
+        print(f"Erro inesperado ao processar o PDF: {e}")
+
+# Chamar a função para processar o PDF e inserir os dados no SQLite
+process_pdf_and_store(file_path)
